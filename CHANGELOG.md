@@ -1,5 +1,65 @@
 # Change Log
 
+## 0.6.6
+
+- Fix compilation on iOS
+
+## 0.6.5
+
+- Fix another segmentation violation on MacOS/iOS introduced in v0.6.1
+
+## 0.6.4
+
+- Fix a segmentation violation on MacOS/iOS introduced in v0.6.1
+
+## 0.6.3
+
+- Add `ServicesChanged::was_invalidated` method to check if a particular service
+  was invalidated by a service changed indication
+
+## 0.6.2
+
+- Add `Device::service_changed_indications` to get a stream of service changed
+  indications from the device
+
+## 0.6.1
+
+- Fix a bug on MacOS/iOS where the event channels could be closed prematurely
+
+## 0.6.0
+
+- `Characteristic::write_without_response` now returns a `Result<()>`
+- Added `Send + Unpin` constraints to returned `impl Stream` values
+- Reduced the number and weight of dependencies
+- Removed static `bluer` session on Linux. Each `Adapter` now starts its own
+  session.
+
+## 0.5.7
+
+- Fix Windows compilation error
+
+## 0.5.6
+
+- Added `Characteristic::max_write_len()` to get the maximum data that can be
+  written to the characteristic in a single packet (this is 3 bytes less than
+  the negotiated MTU for the connection; this is a method on the
+  `Characteristic` instead of the `Device` because Linux only exposes this value
+  on characteristics).
+- Added limited support for `device_connection_events` on MacOS
+- Tightened the behavior of the non-discover counterparts of discovery methods
+  (i.e. `Device::services()`, `Service::characteristics()`,
+  `Service::included_characteristics()`, `Characteristic::descriptors()`) to
+  always perform discovery if discovery has not previously been performed.
+- Fix docs.rs example scraping
+
+## 0.5.5
+
+- Fix docs.rs build
+
+## 0.5.4
+
+- Add `Adapter::device_connection_events`
+
 ## 0.5.3
 
 - Add support for unpairing devices on Windows/Linux

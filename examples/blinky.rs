@@ -2,8 +2,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use bluest::{Adapter, Uuid};
-use futures_util::future::{select, Either};
-use futures_util::{pin_mut, StreamExt};
+use futures_lite::{future, StreamExt};
 use tracing::metadata::LevelFilter;
 use tracing::{error, info};
 
@@ -47,14 +46,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let service = match device
         .discover_services_with_uuid(NORDIC_LED_AND_BUTTON_SERVICE)
         .await?
-        .get(0)
+        .first()
     {
         Some(service) => service.clone(),
         None => return Err("service not found".into()),
     };
     info!("found LED and button service");
 
-    let characteristics = service.discover_characteristics().await?;
+    let characteristics = service.characteristics().await?;
     info!("discovered characteristics");
 
     let button_characteristic = characteristics
@@ -64,15 +63,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let button_fut = async {
         info!("enabling button notifications");
-        let updates = button_characteristic.notify().await?;
-        pin_mut!(updates);
+        let mut updates = button_characteristic.notify().await?;
         info!("waiting for button changes");
         while let Some(val) = updates.next().await {
             info!("Button state changed: {:?}", val?);
         }
         Ok(())
     };
-    pin_mut!(button_fut);
 
     let led_characteristic = characteristics
         .iter()
@@ -91,22 +88,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     };
-    pin_mut!(blink_fut);
 
     type R = Result<(), Box<dyn Error>>;
-    let res: Either<(R, _), (R, _)> = select(blink_fut, button_fut).await;
-    match res {
-        Either::Left((res, button_fut)) => {
-            error!("Blink task exited: {:?}", res);
-            let res = button_fut.await;
-            error!("Button task exited: {:?}", res);
-        }
-        Either::Right((res, blink_fut)) => {
-            error!("Button task exited: {:?}", res);
-            let res = blink_fut.await;
-            error!("Blink task exited: {:?}", res);
-        }
-    }
+    let button_fut = async move {
+        let res: R = button_fut.await;
+        error!("Button task exited: {:?}", res);
+    };
+    let blink_fut = async move {
+        let res: R = blink_fut.await;
+        error!("Blink task exited: {:?}", res);
+    };
+
+    future::zip(blink_fut, button_fut).await;
 
     Ok(())
 }

@@ -1,9 +1,7 @@
-use std::future::ready;
-
-use futures_util::{Stream, StreamExt};
+use futures_core::Stream;
+use futures_lite::StreamExt;
 use objc_foundation::{INSData, INSFastEnumeration};
 use objc_id::ShareId;
-use tokio_stream::wrappers::BroadcastStream;
 
 use super::delegates::{PeripheralDelegate, PeripheralEvent};
 use super::types::{CBCharacteristic, CBCharacteristicWriteType, CBPeripheralState};
@@ -19,13 +17,7 @@ pub struct CharacteristicImpl {
 }
 
 impl Characteristic {
-    pub(super) fn new(characteristic: &CBCharacteristic) -> Self {
-        let service = characteristic.service();
-        let peripheral = service.peripheral();
-        let delegate = peripheral
-            .delegate()
-            .expect("the peripheral should have a delegate attached");
-
+    pub(super) fn new(characteristic: &CBCharacteristic, delegate: ShareId<PeripheralDelegate>) -> Self {
         Characteristic(CharacteristicImpl {
             inner: unsafe { ShareId::from_ptr(characteristic as *const _ as *mut _) },
             delegate,
@@ -69,7 +61,7 @@ impl CharacteristicImpl {
     pub async fn read(&self) -> Result<Vec<u8>> {
         let service = self.inner.service();
         let peripheral = service.peripheral();
-        let mut receiver = self.delegate.sender().subscribe();
+        let mut receiver = self.delegate.sender().new_receiver();
 
         if peripheral.state() != CBPeripheralState::CONNECTED {
             return Err(ErrorKind::NotConnected.into());
@@ -105,7 +97,7 @@ impl CharacteristicImpl {
     pub async fn write(&self, value: &[u8]) -> Result<()> {
         let service = self.inner.service();
         let peripheral = service.peripheral();
-        let mut receiver = self.delegate.sender().subscribe();
+        let mut receiver = self.delegate.sender().new_receiver();
 
         if peripheral.state() != CBPeripheralState::CONNECTED {
             return Err(ErrorKind::NotConnected.into());
@@ -136,19 +128,50 @@ impl CharacteristicImpl {
     }
 
     /// Write the value of this descriptor on the device to `value` without requesting a response.
-    pub async fn write_without_response(&self, value: &[u8]) {
+    pub async fn write_without_response(&self, value: &[u8]) -> Result<()> {
+        let service = self.inner.service();
+        let peripheral = service.peripheral();
+        let mut receiver = self.delegate.sender().new_receiver();
+
+        if peripheral.state() != CBPeripheralState::CONNECTED {
+            return Err(ErrorKind::NotConnected.into());
+        } else if !peripheral.can_send_write_without_response() {
+            while let Ok(evt) = receiver.recv().await {
+                match evt {
+                    PeripheralEvent::ReadyToWrite => break,
+                    PeripheralEvent::Disconnected { error } => {
+                        return Err(Error::from_kind_and_nserror(ErrorKind::NotConnected, error));
+                    }
+                    PeripheralEvent::ServicesChanged { invalidated_services }
+                        if invalidated_services.contains(&service) =>
+                    {
+                        return Err(ErrorKind::ServiceChanged.into());
+                    }
+                    _ => (),
+                }
+            }
+        }
+
         let data = INSData::from_vec(value.to_vec());
-        self.inner.service().peripheral().write_characteristic_value(
-            &self.inner,
-            &data,
-            CBCharacteristicWriteType::WithoutResponse,
-        );
+        peripheral.write_characteristic_value(&self.inner, &data, CBCharacteristicWriteType::WithoutResponse);
+        Ok(())
+    }
+
+    /// Get the maximum amount of data that can be written in a single packet for this characteristic.
+    pub fn max_write_len(&self) -> Result<usize> {
+        let peripheral = self.inner.service().peripheral();
+        Ok(peripheral.maximum_write_value_length_for_type(CBCharacteristicWriteType::WithoutResponse))
+    }
+
+    /// Get the maximum amount of data that can be written in a single packet for this characteristic.
+    pub async fn max_write_len_async(&self) -> Result<usize> {
+        self.max_write_len()
     }
 
     /// Enables notification of value changes for this GATT characteristic.
     ///
     /// Returns a stream of values for the characteristic sent from the device.
-    pub async fn notify(&self) -> Result<impl Stream<Item = Result<Vec<u8>>> + '_> {
+    pub async fn notify(&self) -> Result<impl Stream<Item = Result<Vec<u8>>> + Send + Unpin + '_> {
         let properties = self.properties().await?;
         if !(properties.notify || properties.indicate) {
             return Err(Error::new(
@@ -160,7 +183,7 @@ impl CharacteristicImpl {
 
         let service = self.inner.service();
         let peripheral = service.peripheral();
-        let mut receiver = self.delegate.sender().subscribe();
+        let mut receiver = self.delegate.sender().new_receiver();
 
         if peripheral.state() != CBPeripheralState::CONNECTED {
             return Err(ErrorKind::NotConnected.into());
@@ -192,11 +215,11 @@ impl CharacteristicImpl {
             }
         }
 
-        let updates = BroadcastStream::new(receiver)
+        let updates = receiver
             .filter_map(move |x| {
                 let _guard = &guard;
-                ready(match x {
-                    Ok(PeripheralEvent::CharacteristicValueUpdate { characteristic, error })
+                match x {
+                    PeripheralEvent::CharacteristicValueUpdate { characteristic, error }
                         if characteristic == self.inner =>
                     {
                         match error {
@@ -204,16 +227,16 @@ impl CharacteristicImpl {
                             None => Some(Ok(())),
                         }
                     }
-                    Ok(PeripheralEvent::Disconnected { error }) => {
+                    PeripheralEvent::Disconnected { error } => {
                         Some(Err(Error::from_kind_and_nserror(ErrorKind::NotConnected, error)))
                     }
-                    Ok(PeripheralEvent::ServicesChanged { invalidated_services })
+                    PeripheralEvent::ServicesChanged { invalidated_services }
                         if invalidated_services.contains(&service) =>
                     {
                         Some(Err(ErrorKind::ServiceChanged.into()))
                     }
                     _ => None,
-                })
+                }
             })
             .then(move |x| {
                 Box::pin(async move {
@@ -236,7 +259,7 @@ impl CharacteristicImpl {
     pub async fn discover_descriptors(&self) -> Result<Vec<Descriptor>> {
         let service = self.inner.service();
         let peripheral = service.peripheral();
-        let mut receiver = self.delegate.sender().subscribe();
+        let mut receiver = self.delegate.sender().new_receiver();
 
         if peripheral.state() != CBPeripheralState::CONNECTED {
             return Err(ErrorKind::NotConnected.into());
@@ -264,17 +287,27 @@ impl CharacteristicImpl {
             }
         }
 
-        self.descriptors().await
+        self.descriptors_inner()
     }
 
     /// Get previously discovered descriptors.
     ///
-    /// If no descriptors have been discovered yet, this method may either perform descriptor discovery or
-    /// return an error.
+    /// If no descriptors have been discovered yet, this method will perform descriptor discovery.
     pub async fn descriptors(&self) -> Result<Vec<Descriptor>> {
+        match self.descriptors_inner() {
+            Ok(descriptors) => Ok(descriptors),
+            Err(_) => self.discover_descriptors().await,
+        }
+    }
+
+    fn descriptors_inner(&self) -> Result<Vec<Descriptor>> {
         self.inner
             .descriptors()
-            .map(|s| s.enumerator().map(Descriptor::new).collect())
+            .map(|s| {
+                s.enumerator()
+                    .map(|x| Descriptor::new(x, self.delegate.clone()))
+                    .collect()
+            })
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::NotReady,

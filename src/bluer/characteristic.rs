@@ -1,6 +1,7 @@
 use bluer::gatt::remote::CharacteristicWriteRequest;
 use bluer::gatt::WriteOp;
-use futures_util::{Stream, StreamExt};
+use futures_core::Stream;
+use futures_lite::StreamExt;
 
 use crate::{Characteristic, CharacteristicProperties, Descriptor, Result, Uuid};
 
@@ -87,9 +88,8 @@ impl CharacteristicImpl {
     }
 
     /// Write the value of this descriptor on the device to `value` without requesting a response.
-    pub async fn write_without_response(&self, value: &[u8]) {
-        let _ = self
-            .inner
+    pub async fn write_without_response(&self, value: &[u8]) -> Result<()> {
+        self.inner
             .write_ext(
                 value,
                 &CharacteristicWriteRequest {
@@ -97,19 +97,39 @@ impl CharacteristicImpl {
                     ..Default::default()
                 },
             )
-            .await;
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Get the maximum amount of data that can be written in a single packet for this characteristic.
+    pub fn max_write_len(&self) -> Result<usize> {
+        // Call an async function from a synchronous context
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(move || handle.block_on(self.max_write_len_async())),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(self.max_write_len_async()),
+        }
+    }
+
+    /// Get the maximum amount of data that can be written in a single packet for this characteristic.
+    pub async fn max_write_len_async(&self) -> Result<usize> {
+        let mtu = self.inner.mtu().await?;
+        // GATT characteristic writes have 3 bytes of overhead (opcode + handle id)
+        Ok(mtu - 3)
     }
 
     /// Enables notification of value changes for this GATT characteristic.
     ///
     /// Returns a stream of values for the characteristic sent from the device.
-    pub async fn notify(&self) -> Result<impl Stream<Item = Result<Vec<u8>>> + '_> {
+    pub async fn notify(&self) -> Result<impl Stream<Item = Result<Vec<u8>>> + Send + Unpin + '_> {
         Ok(Box::pin(self.inner.notify().await?.map(Ok)))
     }
 
     /// Is the device currently sending notifications for this characteristic?
     pub async fn is_notifying(&self) -> Result<bool> {
-        self.inner.notifying().await.map_err(Into::into)
+        Ok(self.inner.notifying().await?.unwrap_or(false))
     }
 
     /// Discover the descriptors associated with this characteristic.
@@ -119,8 +139,7 @@ impl CharacteristicImpl {
 
     /// Get previously discovered descriptors.
     ///
-    /// If no descriptors have been discovered yet, this method may either perform descriptor discovery or
-    /// return an error.
+    /// If no descriptors have been discovered yet, this method will perform descriptor discovery.
     pub async fn descriptors(&self) -> Result<Vec<Descriptor>> {
         self.inner
             .descriptors()

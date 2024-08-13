@@ -9,17 +9,12 @@ use crate::{Characteristic, Error, Result, Service, Uuid};
 /// A Bluetooth GATT service
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ServiceImpl {
-    inner: ShareId<CBService>,
+    pub(super) inner: ShareId<CBService>,
     delegate: ShareId<PeripheralDelegate>,
 }
 
 impl Service {
-    pub(super) fn new(service: &CBService) -> Self {
-        let peripheral = service.peripheral();
-        let delegate = peripheral
-            .delegate()
-            .expect("the peripheral should have a delegate attached");
-
+    pub(super) fn new(service: &CBService, delegate: ShareId<PeripheralDelegate>) -> Self {
         Service(ServiceImpl {
             inner: unsafe { ShareId::from_ptr(service as *const _ as *mut _) },
             delegate,
@@ -66,7 +61,7 @@ impl ServiceImpl {
             return Err(ErrorKind::NotConnected.into());
         }
 
-        let mut receiver = self.delegate.sender().subscribe();
+        let mut receiver = self.delegate.sender().new_receiver();
         peripheral.discover_characteristics(&self.inner, uuids);
 
         loop {
@@ -87,17 +82,27 @@ impl ServiceImpl {
             }
         }
 
-        self.characteristics().await
+        self.characteristics_inner()
     }
 
     /// Get previously discovered characteristics.
     ///
-    /// If no characteristics have been discovered yet, this method may either perform characteristic discovery or
-    /// return an error.
+    /// If no characteristics have been discovered yet, this method will perform characteristic discovery.
     pub async fn characteristics(&self) -> Result<Vec<Characteristic>> {
+        match self.characteristics_inner() {
+            Ok(characteristics) => Ok(characteristics),
+            Err(_) => self.discover_characteristics().await,
+        }
+    }
+
+    fn characteristics_inner(&self) -> Result<Vec<Characteristic>> {
         self.inner
             .characteristics()
-            .map(|s| s.enumerator().map(Characteristic::new).collect())
+            .map(|s| {
+                s.enumerator()
+                    .map(|x| Characteristic::new(x, self.delegate.clone()))
+                    .collect()
+            })
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::NotReady,
@@ -130,7 +135,7 @@ impl ServiceImpl {
             return Err(ErrorKind::NotConnected.into());
         }
 
-        let mut receiver = self.delegate.sender().subscribe();
+        let mut receiver = self.delegate.sender().new_receiver();
         peripheral.discover_included_services(&self.inner, uuids);
 
         loop {
@@ -153,17 +158,23 @@ impl ServiceImpl {
             }
         }
 
-        self.included_services().await
+        self.included_services_inner()
     }
 
     /// Get previously discovered included services.
     ///
-    /// If no included services have been discovered yet, this method may either perform included service discovery
-    /// or return an error.
+    /// If no included services have been discovered yet, this method will perform included service discovery.
     pub async fn included_services(&self) -> Result<Vec<Service>> {
+        match self.included_services_inner() {
+            Ok(services) => Ok(services),
+            Err(_) => self.discover_included_services().await,
+        }
+    }
+
+    fn included_services_inner(&self) -> Result<Vec<Service>> {
         self.inner
             .included_services()
-            .map(|s| s.enumerator().map(Service::new).collect())
+            .map(|s| s.enumerator().map(|x| Service::new(x, self.delegate.clone())).collect())
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::NotReady,

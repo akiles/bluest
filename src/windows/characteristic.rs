@@ -1,4 +1,5 @@
-use futures_util::{Stream, StreamExt};
+use futures_core::Stream;
+use futures_lite::StreamExt;
 use tracing::{error, warn};
 use windows::Devices::Bluetooth::BluetoothCacheMode;
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
@@ -116,8 +117,8 @@ impl CharacteristicImpl {
     }
 
     /// Write the value of this descriptor on the device to `value` without requesting a response.
-    pub async fn write_without_response(&self, value: &[u8]) {
-        let _res = self.write_kind(value, GattWriteOption::WriteWithoutResponse).await;
+    pub async fn write_without_response(&self, value: &[u8]) -> Result<()> {
+        self.write_kind(value, GattWriteOption::WriteWithoutResponse).await
     }
 
     async fn write_kind(&self, value: &[u8], writeoption: GattWriteOption) -> Result<()> {
@@ -132,10 +133,22 @@ impl CharacteristicImpl {
         check_communication_status(res.Status()?, res.ProtocolError(), "writing characteristic")
     }
 
+    /// Get the maximum amount of data that can be written in a single packet for this characteristic.
+    pub fn max_write_len(&self) -> Result<usize> {
+        let mtu = self.inner.Service()?.Session()?.MaxPduSize()?;
+        // GATT characteristic writes have 3 bytes of overhead (opcode + handle id)
+        Ok(usize::from(mtu) - 3)
+    }
+
+    /// Get the maximum amount of data that can be written in a single packet for this characteristic.
+    pub async fn max_write_len_async(&self) -> Result<usize> {
+        self.max_write_len()
+    }
+
     /// Enables notification of value changes for this GATT characteristic.
     ///
     /// Returns a stream of values for the characteristic sent from the device.
-    pub async fn notify(&self) -> Result<impl Stream<Item = Result<Vec<u8>>> + '_> {
+    pub async fn notify(&self) -> Result<impl Stream<Item = Result<Vec<u8>>> + Send + Unpin + '_> {
         let props = self.properties().await?;
         let value = if props.notify {
             GattClientCharacteristicConfigurationDescriptorValue::Notify
@@ -249,8 +262,7 @@ impl CharacteristicImpl {
 
     /// Get previously discovered descriptors.
     ///
-    /// If no descriptors have been discovered yet, this method may either perform descriptor discovery or
-    /// return an empty set.
+    /// If no descriptors have been discovered yet, this method will perform descriptor discovery.
     pub async fn descriptors(&self) -> Result<Vec<Descriptor>> {
         self.get_descriptors(BluetoothCacheMode::Cached).await
     }
