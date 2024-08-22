@@ -117,12 +117,6 @@ impl Device {
         self.0.services().await
     }
 
-    /// Open l2cap channel given psm.
-    #[inline]
-    pub async fn open_l2cap_channel(&self, psm: u16) -> Result<objc_id::ShareId<sys::types::CBL2CAPChannel>> {
-        self.0.open_l2cap_channel(psm).await
-    }
-
     /// Asynchronously blocks until a GATT services changed packet is received
     ///
     /// # Platform specific

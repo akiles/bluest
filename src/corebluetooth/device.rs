@@ -4,10 +4,11 @@ use futures_core::Stream;
 use futures_lite::StreamExt;
 use objc_foundation::{INSArray, INSFastEnumeration, INSString, NSArray};
 use objc_id::ShareId;
+use tracing::debug;
 
 use super::delegates::{PeripheralDelegate, PeripheralEvent};
 use super::l2cap_channel::{L2capChannelReader, L2capChannelWriter};
-use super::types::{CBPeripheral, CBL2CAPChannel, CBPeripheralState, CBService, CBUUID};
+use super::types::{CBPeripheral, CBPeripheralState, CBService, CBUUID};
 use crate::device::ServicesChanged;
 use crate::error::ErrorKind;
 use crate::pairing::PairingAgent;
@@ -227,6 +228,7 @@ impl DeviceImpl {
             return Err(ErrorKind::NotConnected.into());
         }
 
+        debug!("open_l2cap_channel {:?}", self.peripheral);
         self.peripheral.open_l2cap_channel(psm);
 
         let l2capchannel = loop {
@@ -244,9 +246,12 @@ impl DeviceImpl {
             }
         };
 
-        // Here you would implement the conversion from CBL2CAPChannel to L2capChannelReader and L2capChannelWriter
-        // For now, we'll return a placeholder implementation
-        Err(ErrorKind::NotSupported.into())
+        debug!("open_l2cap_channel success {:?}", self.peripheral);
+
+        let reader = L2capChannelReader::new(l2capchannel.clone());
+        let writer = L2capChannelWriter::new(l2capchannel);
+
+        Ok((reader, writer))
     }
 }
 

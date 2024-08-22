@@ -30,7 +30,7 @@ serde = { version = "1.0.143", optional = true, features = ["derive"] }
 tracing = { version = "0.1.36", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.20.1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.20.1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tracing-subscriber = { version = "0.3.15", features = ["env-filter"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
@@ -59,6 +59,7 @@ java-spaghetti = "0.2.0"
 async-channel = "2.2.0"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+async-channel = "2.2.0"
 async-broadcast = "0.5.1"
 objc = "0.2.7"
 objc_id = "0.1.1"
