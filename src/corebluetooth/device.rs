@@ -1,10 +1,15 @@
 #![allow(clippy::let_unit_value)]
 
+use futures_core::Stream;
+use futures_lite::StreamExt;
 use objc_foundation::{INSArray, INSFastEnumeration, INSString, NSArray};
 use objc_id::ShareId;
+use tracing::debug;
 
 use super::delegates::{PeripheralDelegate, PeripheralEvent};
-use super::types::{CBPeripheral, CBL2CAPChannel, CBPeripheralState, CBUUID};
+use super::l2cap_channel::{L2capChannelReader, L2capChannelWriter};
+use super::types::{CBPeripheral, CBPeripheralState, CBService, CBUUID};
+use crate::device::ServicesChanged;
 use crate::error::ErrorKind;
 use crate::pairing::PairingAgent;
 use crate::{Device, DeviceId, Error, Result, Service, Uuid};
@@ -46,8 +51,7 @@ impl Device {
     pub(super) fn new(peripheral: ShareId<CBPeripheral>) -> Self {
         let delegate = peripheral.delegate().unwrap_or_else(|| {
             // Create a new delegate and attach it to the peripheral
-            let (sender, _) = tokio::sync::broadcast::channel(16);
-            let delegate = PeripheralDelegate::with_sender(sender).share();
+            let delegate = PeripheralDelegate::new().share();
             peripheral.set_delegate(&delegate);
             delegate
         });
@@ -131,7 +135,7 @@ impl DeviceImpl {
     }
 
     async fn discover_services_inner(&self, uuids: Option<&NSArray<CBUUID>>) -> Result<Vec<Service>> {
-        let mut receiver = self.delegate.sender().subscribe();
+        let mut receiver = self.delegate.sender().new_receiver();
 
         if !self.is_connected().await {
             return Err(ErrorKind::NotConnected.into());
@@ -150,16 +154,23 @@ impl DeviceImpl {
             }
         }
 
-        self.services().await
+        self.services_inner()
     }
 
     /// Get previously discovered services.
     ///
-    /// If no services have been discovered yet, this method may either perform service discovery or return an error.
+    /// If no services have been discovered yet, this method will perform service discovery.
     pub async fn services(&self) -> Result<Vec<Service>> {
+        match self.services_inner() {
+            Ok(services) => Ok(services),
+            Err(_) => self.discover_services().await,
+        }
+    }
+
+    fn services_inner(&self) -> Result<Vec<Service>> {
         self.peripheral
             .services()
-            .map(|s| s.enumerator().map(Service::new).collect())
+            .map(|s| s.enumerator().map(|x| Service::new(x, self.delegate.clone())).collect())
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::NotReady,
@@ -169,30 +180,30 @@ impl DeviceImpl {
             })
     }
 
-    /// Asynchronously blocks until a GATT services changed packet is received
-    pub async fn services_changed(&self) -> Result<()> {
-        let mut receiver = self.delegate.sender().subscribe();
+    /// Monitors the device for services changed events.
+    pub async fn service_changed_indications(
+        &self,
+    ) -> Result<impl Stream<Item = Result<ServicesChanged>> + Send + Unpin + '_> {
+        let receiver = self.delegate.sender().new_receiver();
 
         if !self.is_connected().await {
             return Err(ErrorKind::NotConnected.into());
         }
 
-        loop {
-            match receiver.recv().await.map_err(Error::from_recv_error)? {
-                PeripheralEvent::ServicesChanged { .. } => break,
-                PeripheralEvent::Disconnected { error } => {
-                    return Err(Error::from_kind_and_nserror(ErrorKind::NotConnected, error))
-                }
-                _ => (),
+        Ok(receiver.filter_map(|ev| match ev {
+            PeripheralEvent::ServicesChanged { invalidated_services } => {
+                Some(Ok(ServicesChanged(ServicesChangedImpl(invalidated_services))))
             }
-        }
-
-        Ok(())
+            PeripheralEvent::Disconnected { error } => {
+                Some(Err(Error::from_kind_and_nserror(ErrorKind::NotConnected, error)))
+            }
+            _ => None,
+        }))
     }
 
     /// Get the current signal strength from the device in dBm.
     pub async fn rssi(&self) -> Result<i16> {
-        let mut receiver = self.delegate.sender().subscribe();
+        let mut receiver = self.delegate.sender().new_receiver();
         self.peripheral.read_rssi();
 
         loop {
@@ -206,33 +217,49 @@ impl DeviceImpl {
     }
 
     /// Open L2CAP channel given PSM
-    pub async fn open_l2cap_channel(&self, psm: u16) -> Result<objc_id::Id<CBL2CAPChannel, objc_id::Shared>> {
-        let mut receiver = self.delegate.sender().subscribe();
+    pub async fn open_l2cap_channel(
+        &self,
+        psm: u16,
+        _secure: bool,
+    ) -> Result<(L2capChannelReader, L2capChannelWriter)> {
+        let mut receiver = self.delegate.sender().new_receiver();
 
         if !self.is_connected().await {
             return Err(ErrorKind::NotConnected.into());
         }
 
+        debug!("open_l2cap_channel {:?}", self.peripheral);
         self.peripheral.open_l2cap_channel(psm);
 
-        let l2capchannel;
-
-        loop {
+        let l2capchannel = loop {
             match receiver.recv().await.map_err(Error::from_recv_error)? {
                 PeripheralEvent::L2CAPChannelOpened { channel, error: None } => {
-                    l2capchannel = channel;
-                    break;
+                    break channel;
                 }
-                PeripheralEvent::L2CAPChannelOpened { channel, error } => {
-                    return Err(Error::from_nserror(error.unwrap()))
+                PeripheralEvent::L2CAPChannelOpened { error: Some(err), .. } => {
+                    return Err(Error::from_nserror(err))
                 }
                 PeripheralEvent::Disconnected { error } => {
                     return Err(Error::from_kind_and_nserror(ErrorKind::NotConnected, error));
                 }
                 _ => (),
             }
-        }
+        };
 
-        Ok(l2capchannel)
+        debug!("open_l2cap_channel success {:?}", self.peripheral);
+
+        let reader = L2capChannelReader::new(l2capchannel.clone());
+        let writer = L2capChannelWriter::new(l2capchannel);
+
+        Ok((reader, writer))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ServicesChangedImpl(Vec<ShareId<CBService>>);
+
+impl ServicesChangedImpl {
+    pub fn was_invalidated(&self, service: &Service) -> bool {
+        self.0.contains(&service.0.inner)
     }
 }

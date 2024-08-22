@@ -1,6 +1,8 @@
+use std::pin::pin;
+
 use futures_channel::mpsc;
-use futures_util::future::{select, Either};
-use futures_util::{pin_mut, StreamExt};
+use futures_core::Stream;
+use futures_lite::{future, StreamExt};
 use tracing::error;
 use windows::core::{GUID, HSTRING};
 use windows::Devices::Bluetooth::{
@@ -10,6 +12,8 @@ use windows::Devices::Enumeration::{DevicePairingKinds, DevicePairingRequestedEv
 use windows::Foundation::TypedEventHandler;
 
 use super::error::{check_communication_status, check_pairing_status, check_unpairing_status};
+use super::l2cap_channel::{L2capChannelReader, L2capChannelWriter};
+use crate::device::ServicesChanged;
 use crate::error::ErrorKind;
 use crate::pairing::{IoCapability, PairingAgent, Passkey};
 use crate::util::defer;
@@ -18,7 +22,7 @@ use crate::{Device, DeviceId, Error, Result, Service, Uuid};
 /// A Bluetooth LE device
 #[derive(Clone)]
 pub struct DeviceImpl {
-    inner: BluetoothLEDevice,
+    pub(super) inner: BluetoothLEDevice,
 }
 
 impl PartialEq for DeviceImpl {
@@ -145,7 +149,7 @@ impl DeviceImpl {
         let op = custom.PairAsync(pairing_kinds_supported)?;
 
         let device = Device(self.clone());
-        let pairing_fut = async move {
+        let pairing_fut = pin!(async move {
             while let Some((event_args, deferral)) = rx.next().await {
                 match event_args.PairingKind()? {
                     DevicePairingKinds::ConfirmOnly => {
@@ -177,18 +181,22 @@ impl DeviceImpl {
             }
 
             Result::<_, Error>::Ok(())
-        };
-        pin_mut!(pairing_fut);
+        });
 
-        match select(op, pairing_fut).await {
-            Either::Left((res, _)) => check_pairing_status(res?.Status()?),
-            Either::Right((Ok(()), _)) => Err(Error::new(
-                ErrorKind::Other,
-                None,
-                "Pairing agent terminated unexpectedly".to_owned(),
-            )),
-            Either::Right((Err(err), _)) => Err(err),
-        }
+        let op = async move {
+            let res = op.await;
+            check_pairing_status(res?.Status()?)
+        };
+        let pairing_fut = async move {
+            pairing_fut.await.and_then(|_| {
+                Err(Error::new(
+                    ErrorKind::Other,
+                    None,
+                    "Pairing agent terminated unexpectedly".to_owned(),
+                ))
+            })
+        };
+        future::or(op, pairing_fut).await
     }
 
     /// Disconnect and unpair this device from the system
@@ -223,8 +231,7 @@ impl DeviceImpl {
 
     /// Get previously discovered services.
     ///
-    /// If no services have been discovered yet, this method may either perform service discovery or return an empty
-    /// set.
+    /// If no services have been discovered yet, this method will perform service discovery.
     pub async fn services(&self) -> Result<Vec<Service>> {
         let res = self
             .inner
@@ -235,25 +242,28 @@ impl DeviceImpl {
         Ok(services.into_iter().map(Service::new).collect())
     }
 
-    /// Asynchronously blocks until a GATT services changed packet is received
-    pub async fn services_changed(&self) -> Result<()> {
-        let (sender, receiver) = futures_channel::oneshot::channel();
-        let mut sender = Some(sender);
+    /// Monitors the device for services changed events.
+    pub async fn service_changed_indications(
+        &self,
+    ) -> Result<impl Stream<Item = Result<ServicesChanged>> + Send + Unpin + '_> {
+        let (mut sender, receiver) = futures_channel::mpsc::channel(16);
         let token = self.inner.GattServicesChanged(&TypedEventHandler::new(move |_, _| {
-            if let Some(sender) = sender.take() {
-                let _ = sender.send(());
+            if let Err(err) = sender.try_send(Ok(ServicesChanged(ServicesChangedImpl))) {
+                error!("Error sending service changed indication: {:?}", err);
             }
             Ok(())
         }))?;
 
-        let _guard = defer(move || {
+        let guard = defer(move || {
             if let Err(err) = self.inner.RemoveGattServicesChanged(token) {
                 error!("Error removing state changed handler: {:?}", err);
             }
         });
 
-        receiver.await.unwrap();
-        Ok(())
+        Ok(receiver.map(move |x| {
+            let _guard = &guard;
+            x
+        }))
     }
 
     /// Get the current signal strength from the device in dBm.
@@ -261,5 +271,22 @@ impl DeviceImpl {
     /// Returns [ErrorKind::NotSupported].
     pub async fn rssi(&self) -> Result<i16> {
         Err(ErrorKind::NotSupported.into())
+    }
+
+    pub async fn open_l2cap_channel(
+        &self,
+        _psm: u16,
+        _secure: bool,
+    ) -> std::prelude::v1::Result<(L2capChannelReader, L2capChannelWriter), crate::Error> {
+        Err(ErrorKind::NotSupported.into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ServicesChangedImpl;
+
+impl ServicesChangedImpl {
+    pub fn was_invalidated(&self, _service: &Service) -> bool {
+        true
     }
 }

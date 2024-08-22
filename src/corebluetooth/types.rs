@@ -161,18 +161,18 @@ impl NSStreamStatus {
 impl AdvertisementData {
     pub(super) fn from_nsdictionary(adv_data: &ShareId<NSDictionary<NSString, NSObject>>) -> Self {
         let is_connectable = adv_data
-            .object_for(&*INSString::from_str("kCBAdvDataIsConnectable"))
+            .object_for(unsafe { extern_nsstring(CBAdvertisementDataIsConnectable) })
             .map_or(false, |val| unsafe {
                 let n: BOOL = msg_send![val, boolValue];
                 n != NO
             });
 
         let local_name = adv_data
-            .object_for(&*INSString::from_str("kCBAdvDataLocalName"))
+            .object_for(unsafe { extern_nsstring(CBAdvertisementDataLocalNameKey) })
             .map(|val| unsafe { (*(val as *const NSObject).cast::<NSString>()).as_str().to_string() });
 
         let manufacturer_data = adv_data
-            .object_for(&*INSString::from_str("kCBAdvDataManufacturerData"))
+            .object_for(unsafe { extern_nsstring(CBAdvertisementDataManufacturerDataKey) })
             .map(|val| unsafe { (*(val as *const NSObject).cast::<NSData>()).bytes() })
             .and_then(|val| {
                 (val.len() >= 2).then(|| ManufacturerData {
@@ -182,30 +182,27 @@ impl AdvertisementData {
             });
 
         let tx_power_level: Option<i16> = adv_data
-            .object_for(&*INSString::from_str("kCBAdvDataTxPowerLevel"))
+            .object_for(unsafe { extern_nsstring(CBAdvertisementDataTxPowerLevelKey) })
             .map(|val| unsafe { msg_send![val, shortValue] });
 
-        let service_data = if let Some(val) = adv_data.object_for(&*INSString::from_str("kCBAdvDataServiceData")) {
-            unsafe {
-                let val: &NSDictionary<CBUUID, NSData> = &*(val as *const NSObject).cast();
-                let mut res = HashMap::with_capacity(val.count());
-                for k in val.enumerator() {
-                    res.insert(k.to_uuid(), val.object_for(k).unwrap().bytes().to_vec());
+        let service_data =
+            if let Some(val) = adv_data.object_for(unsafe { extern_nsstring(CBAdvertisementDataServiceDataKey) }) {
+                unsafe {
+                    let val: &NSDictionary<CBUUID, NSData> = &*(val as *const NSObject).cast();
+                    let mut res = HashMap::with_capacity(val.count());
+                    for k in val.enumerator() {
+                        res.insert(k.to_uuid(), val.object_for(k).unwrap().bytes().to_vec());
+                    }
+                    res
                 }
-                res
-            }
-        } else {
-            HashMap::new()
-        };
+            } else {
+                HashMap::new()
+            };
 
         let services = adv_data
-            .object_for(&*INSString::from_str("kCBAdvDataServiceUUIDs"))
+            .object_for(unsafe { extern_nsstring(CBAdvertisementDataServiceUUIDsKey) })
             .into_iter()
-            .chain(
-                adv_data
-                    .object_for(&*INSString::from_str("kCBAdvDataHashedServiceUUIDs"))
-                    .into_iter(),
-            )
+            .chain(adv_data.object_for(unsafe { extern_nsstring(CBAdvertisementDataOverflowServiceUUIDsKey) }))
             .flat_map(|x| {
                 let val: &NSArray<CBUUID> = unsafe { &*(x as *const NSObject).cast() };
                 val.enumerator()
@@ -231,6 +228,20 @@ extern "C" {
     pub fn dispatch_queue_create(label: *const c_char, attr: id) -> id;
     pub fn dispatch_get_global_queue(identifier: isize, flags: usize) -> id;
     pub fn dispatch_release(object: id) -> c_void;
+
+    // CBAdvertisementData keys
+    static CBAdvertisementDataLocalNameKey: id;
+    static CBAdvertisementDataManufacturerDataKey: id;
+    static CBAdvertisementDataServiceDataKey: id;
+    static CBAdvertisementDataServiceUUIDsKey: id;
+    static CBAdvertisementDataOverflowServiceUUIDsKey: id;
+    static CBAdvertisementDataTxPowerLevelKey: id;
+    static CBAdvertisementDataIsConnectable: id;
+    static CBAdvertisementDataSolicitedServiceUUIDsKey: id;
+
+    // CBConnectionEventMatchingOption
+    static CBConnectionEventMatchingOptionPeripheralUUIDs: id;
+    static CBConnectionEventMatchingOptionServiceUUIDs: id;
 }
 
 pub const QOS_CLASS_USER_INTERACTIVE: isize = 0x21;
@@ -249,6 +260,18 @@ pub fn id_or_nil<T>(val: Option<&T>) -> *const T {
 
 pub unsafe fn option_from_ptr<T: objc::Message, O: objc_id::Ownership>(ptr: *mut T) -> Option<Id<T, O>> {
     (!ptr.is_null()).then(|| Id::from_ptr(ptr))
+}
+
+unsafe fn extern_nsstring(ptr: id) -> &'static NSString {
+    &*(ptr as *const NSString)
+}
+
+pub fn connection_event_matching_option_peripheral_uuids() -> &'static NSString {
+    unsafe { extern_nsstring(CBConnectionEventMatchingOptionPeripheralUUIDs) }
+}
+
+pub fn connection_event_matching_option_service_uuids() -> &'static NSString {
+    unsafe { extern_nsstring(CBConnectionEventMatchingOptionServiceUUIDs) }
 }
 
 object_struct!(NSError);
@@ -399,8 +422,11 @@ impl CBCentralManager {
         autoreleasepool(move || unsafe { option_from_ptr(msg_send![self, delegate]) })
     }
 
-    pub fn register_for_connection_events_with_options(&self, options: &NSDictionary<NSString, NSObject>) {
-        unsafe { msg_send![self, registerForConnectionEventsWithOptions: options] }
+    pub fn register_for_connection_events_with_options(
+        &self,
+        options: Option<&NSDictionary<NSString, NSArray<CBUUID>>>,
+    ) {
+        unsafe { msg_send![self, registerForConnectionEventsWithOptions: id_or_nil(options)] }
     }
 }
 
@@ -463,6 +489,11 @@ impl CBPeripheral {
         unsafe { msg_send![self, writeValue: value forCharacteristic: characteristic type: write_type] }
     }
 
+    pub fn maximum_write_value_length_for_type(&self, write_type: CBCharacteristicWriteType) -> NSUInteger {
+        let write_type: isize = write_type as isize;
+        unsafe { msg_send![self, maximumWriteValueLengthForType: write_type] }
+    }
+
     pub fn write_descriptor_value(&self, descriptor: &CBDescriptor, value: &NSData) {
         unsafe { msg_send![self, writeValue: value forDescriptor: descriptor] }
     }
@@ -473,6 +504,11 @@ impl CBPeripheral {
 
     pub fn state(&self) -> CBPeripheralState {
         CBPeripheralState(unsafe { msg_send![self, state] })
+    }
+
+    pub fn can_send_write_without_response(&self) -> bool {
+        let res: BOOL = unsafe { msg_send![self, canSendWriteWithoutResponse] };
+        res != NO
     }
 
     pub fn read_rssi(&self) {

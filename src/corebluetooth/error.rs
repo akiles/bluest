@@ -6,15 +6,7 @@ pub use super::types::NSError;
 use crate::error::{AttError, ErrorKind};
 
 impl crate::Error {
-    pub(super) fn from_recv_error(err: tokio::sync::broadcast::error::RecvError) -> Self {
-        crate::Error::new(
-            ErrorKind::Internal,
-            Some(Box::new(err)),
-            "receiving delegate event".to_string(),
-        )
-    }
-
-    pub(super) fn from_stream_recv_error(err: tokio_stream::wrappers::errors::BroadcastStreamRecvError) -> Self {
+    pub(super) fn from_recv_error(err: async_broadcast::RecvError) -> Self {
         crate::Error::new(
             ErrorKind::Internal,
             Some(Box::new(err)),
@@ -24,7 +16,7 @@ impl crate::Error {
 
     pub(super) fn from_nserror(err: ShareId<NSError>) -> Self {
         crate::Error::new(
-            kind_from_nserror(&*err),
+            kind_from_nserror(&err),
             Some(Box::new(NSErrorError(err))),
             String::new(),
         )
@@ -89,6 +81,6 @@ impl std::ops::Deref for NSErrorError {
     type Target = NSError;
 
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &self.0
     }
 }

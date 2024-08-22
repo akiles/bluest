@@ -45,14 +45,7 @@ fn value_to_slice(val: &NSObject) -> Vec<u8> {
 }
 
 impl Descriptor {
-    pub(super) fn new(descriptor: &CBDescriptor) -> Self {
-        let characteristic = descriptor.characteristic();
-        let service = characteristic.service();
-        let peripheral = service.peripheral();
-        let delegate = peripheral
-            .delegate()
-            .expect("the peripheral should have a delegate attached");
-
+    pub(super) fn new(descriptor: &CBDescriptor, delegate: ShareId<PeripheralDelegate>) -> Self {
         Descriptor(DescriptorImpl {
             inner: unsafe { ShareId::from_ptr(descriptor as *const _ as *mut _) },
             delegate,
@@ -75,7 +68,7 @@ impl DescriptorImpl {
     ///
     /// If the value has not yet been read, this method may either return an error or perform a read of the value.
     pub async fn value(&self) -> Result<Vec<u8>> {
-        self.inner.value().map(|val| value_to_slice(&*val)).ok_or_else(|| {
+        self.inner.value().map(|val| value_to_slice(&val)).ok_or_else(|| {
             Error::new(
                 ErrorKind::NotReady,
                 None,
@@ -88,7 +81,7 @@ impl DescriptorImpl {
     pub async fn read(&self) -> Result<Vec<u8>> {
         let service = self.inner.characteristic().service();
         let peripheral = service.peripheral();
-        let mut receiver = self.delegate.sender().subscribe();
+        let mut receiver = self.delegate.sender().new_receiver();
 
         if peripheral.state() != CBPeripheralState::CONNECTED {
             return Err(ErrorKind::NotConnected.into());
@@ -120,7 +113,7 @@ impl DescriptorImpl {
     pub async fn write(&self, value: &[u8]) -> Result<()> {
         let service = self.inner.characteristic().service();
         let peripheral = service.peripheral();
-        let mut receiver = self.delegate.sender().subscribe();
+        let mut receiver = self.delegate.sender().new_receiver();
 
         if peripheral.state() != CBPeripheralState::CONNECTED {
             return Err(ErrorKind::NotConnected.into());

@@ -14,7 +14,7 @@
 //!
 //! ```rust,no_run
 //!# use bluest::Adapter;
-//!# use futures_util::StreamExt;
+//!# use futures_lite::StreamExt;
 //!# #[tokio::main]
 //!# async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!let adapter = Adapter::default().await.ok_or("Bluetooth adapter not found")?;
@@ -68,28 +68,28 @@
 //! # Platform specifics
 //!
 //! Because Bluest aims to provide a thin abstraction over the platform-specific APIs, the available APIs represent the
-//! lowest common denominator of APIs among the supported platforms. In most cases Apple's CoreBluetooth API is the
-//! most restricted and therefore imposes the limit on what can be supported in a cross platform library. For example,
-//! CoreBluetooth never exposes the Bluetooth address of devices to applications, therefore there is no method on
-//! `Device` for retrieving an address or even any Bluetooth address struct in the crate.
+//! lowest common denominator of APIs among the supported platforms. For example, CoreBluetooth never exposes the
+//! Bluetooth address of devices to applications, therefore there is no method on `Device` for retrieving an address or
+//! even any Bluetooth address struct in the crate.
 //!
 //! Most Bluest APIs should behave consistently across all supported platforms. Those APIs with significant differences
 //! in behavior are summarized in the table below.
 //!
-//!| Method                                     | MacOS/iOS | Windows | Linux |
-//!|--------------------------------------------|:---------:|:-------:|:-----:|
-//!| [`Adapter::connect_device`][Adapter::connect_device]       | ✅ | ✨ | ✅ |
-//!| [`Adapter::disconnect_device`][Adapter::disconnect_device] | ✅ | ✨ | ✅ |
-//!| [`Device::name`][Device::name]                             | ✅ | ✅ | ⌛️ |
-//!| [`Device::is_paired`][Device::is_paired]                   | ❌ | ✅ | ✅ |
-//!| [`Device::pair`][Device::pair]                             | ✨ | ✅ | ✅ |
-//!| [`Device::pair_with_agent`][Device::pair_with_agent]       | ✨ | ✅ | ✅ |
-//!| [`Device::unpair`][Device::unpair]                         | ❌ | ✅ | ✅ |
-//!| [`Device::rssi`][Device::rssi]                             | ✅ | ❌ | ❌ |
-//!| [`Service::uuid`][Service::uuid]                           | ✅ | ✅ | ⌛️ |
-//!| [`Service::is_primary`][Service::is_primary]               | ✅ | ❌ | ✅ |
-//!| [`Characteristic::uuid`][Characteristic::uuid]             | ✅ | ✅ | ⌛️ |
-//!| [`Descriptor::uuid`][Descriptor::uuid]                     | ✅ | ✅ | ⌛️ |
+//!| Method                                                   | MacOS/iOS | Windows | Linux |
+//!|----------------------------------------------------------|:---------:|:-------:|:-----:|
+//!| [`Adapter::connect_device`][Adapter::connect_device]                     | ✅ | ✨ | ✅ |
+//!| [`Adapter::disconnect_device`][Adapter::disconnect_device]               | ✅ | ✨ | ✅ |
+//!| [`Device::name`][Device::name]                                           | ✅ | ✅ | ⌛️ |
+//!| [`Device::is_paired`][Device::is_paired]                                 | ❌ | ✅ | ✅ |
+//!| [`Device::pair`][Device::pair]                                           | ✨ | ✅ | ✅ |
+//!| [`Device::pair_with_agent`][Device::pair_with_agent]                     | ✨ | ✅ | ✅ |
+//!| [`Device::unpair`][Device::unpair]                                       | ❌ | ✅ | ✅ |
+//!| [`Device::rssi`][Device::rssi]                                           | ✅ | ❌ | ❌ |
+//!| [`Service::uuid`][Service::uuid]                                         | ✅ | ✅ | ⌛️ |
+//!| [`Service::is_primary`][Service::is_primary]                             | ✅ | ❌ | ✅ |
+//!| [`Characteristic::uuid`][Characteristic::uuid]                           | ✅ | ✅ | ⌛️ |
+//!| [`Characteristic::max_write_len`][Characteristic::max_write_len]         | ✅ | ✅ | ⌛️ |
+//!| [`Descriptor::uuid`][Descriptor::uuid]                                   | ✅ | ✅ | ⌛️ |
 //!
 //! ✅ = supported  
 //! ✨ = managed automatically by the OS, this method is a no-op  
@@ -119,10 +119,13 @@ mod characteristic;
 mod descriptor;
 mod device;
 pub mod error;
+mod l2cap_channel;
 pub mod pairing;
 mod service;
 mod util;
 
+#[cfg(target_os = "android")]
+mod android;
 #[cfg(target_os = "linux")]
 mod bluer;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -138,13 +141,16 @@ pub use adapter::Adapter;
 pub use btuuid::BluetoothUuidExt;
 pub use characteristic::Characteristic;
 pub use descriptor::Descriptor;
-pub use device::Device;
+pub use device::{Device, ServicesChanged};
 pub use error::Error;
+pub use l2cap_channel::{L2capChannel, L2capChannelReader, L2capChannelWriter};
 pub use service::Service;
 pub use sys::DeviceId;
 #[cfg(not(target_os = "linux"))]
 pub use uuid::Uuid;
 
+#[cfg(target_os = "android")]
+use crate::android as sys;
 #[cfg(target_os = "linux")]
 use crate::bluer as sys;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -155,13 +161,22 @@ use crate::windows as sys;
 /// Convenience alias for a result with [`Error`]
 pub type Result<T, E = Error> = core::result::Result<T, E>;
 
-/// Events generated by [`Adapter`]
+/// Events generated by [`Adapter::events`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AdapterEvent {
     /// The adapter has become available (powered on and ready to use)
     Available,
     /// The adapter has become unavailable (powered off or otherwise disabled)
     Unavailable,
+}
+
+/// Events generated by [`Adapter::device_connection_events`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConnectionEvent {
+    /// The device has disconnected from the host system
+    Disconnected,
+    /// The device has connected to the host system
+    Connected,
 }
 
 /// Represents a device discovered during a scan operation

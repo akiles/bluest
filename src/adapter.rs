@@ -1,8 +1,8 @@
 #![allow(clippy::let_unit_value)]
 
-use futures_util::Stream;
+use futures_core::Stream;
 
-use crate::{sys, AdapterEvent, AdvertisingDevice, Device, DeviceId, Result, Uuid};
+use crate::{sys, AdapterEvent, AdvertisingDevice, ConnectionEvent, Device, DeviceId, Result, Uuid};
 
 /// The system's Bluetooth adapter interface.
 ///
@@ -11,15 +11,31 @@ use crate::{sys, AdapterEvent, AdvertisingDevice, Device, DeviceId, Result, Uuid
 pub struct Adapter(sys::adapter::AdapterImpl);
 
 impl Adapter {
+    /// Creates an interface to the default Bluetooth adapter for the system.
+    ///
+    /// # Safety
+    ///
+    /// - `java_vm` must be a valid JNI `JavaVM` pointer to a VM that will stay alive for the entire duration the `Adapter` or any structs obtained from it are live.
+    /// - `bluetooth_manager` must be a valid global reference to an `android.bluetooth.BluetoothManager` instance, from the `java_vm` VM.
+    /// - The `Adapter` takes ownership of the global reference and will delete it with the `DeleteGlobalRef` JNI call when dropped. You must not do that yourself.
+    #[cfg(target_os = "android")]
+    pub unsafe fn new(
+        java_vm: *mut java_spaghetti::sys::JavaVM,
+        bluetooth_manager: java_spaghetti::sys::jobject,
+    ) -> Result<Self> {
+        sys::adapter::AdapterImpl::new(java_vm, bluetooth_manager).map(Self)
+    }
+
     /// Creates an interface to the default Bluetooth adapter for the system
     #[inline]
+    #[cfg(not(target_os = "android"))]
     pub async fn default() -> Option<Self> {
         sys::adapter::AdapterImpl::default().await.map(Adapter)
     }
 
     /// A stream of [`AdapterEvent`] which allows the application to identify when the adapter is enabled or disabled.
     #[inline]
-    pub async fn events(&self) -> Result<impl Stream<Item = Result<AdapterEvent>> + '_> {
+    pub async fn events(&self) -> Result<impl Stream<Item = Result<AdapterEvent>> + Send + Unpin + '_> {
         self.0.events().await
     }
 
@@ -60,7 +76,10 @@ impl Adapter {
     /// If `services` is not empty, returns advertisements including at least one GATT service with a UUID in
     /// `services`. Otherwise returns all advertisements.
     #[inline]
-    pub async fn scan<'a>(&'a self, services: &'a [Uuid]) -> Result<impl Stream<Item = AdvertisingDevice> + 'a> {
+    pub async fn scan<'a>(
+        &'a self,
+        services: &'a [Uuid],
+    ) -> Result<impl Stream<Item = AdvertisingDevice> + Send + Unpin + 'a> {
         self.0.scan(services).await
     }
 
@@ -74,7 +93,7 @@ impl Adapter {
     pub async fn discover_devices<'a>(
         &'a self,
         services: &'a [Uuid],
-    ) -> Result<impl Stream<Item = Result<Device>> + 'a> {
+    ) -> Result<impl Stream<Item = Result<Device>> + Send + Unpin + 'a> {
         self.0.discover_devices(services).await
     }
 
@@ -127,5 +146,23 @@ impl Adapter {
     #[inline]
     pub async fn disconnect_device(&self, device: &Device) -> Result<()> {
         self.0.disconnect_device(device).await
+    }
+
+    /// Monitors a device for connection/disconnection events.
+    ///
+    /// # Platform specifics
+    ///
+    /// ## MacOS/iOS
+    ///
+    /// On MacOS connection events will only be generated for calls to `connect_device` and disconnection events
+    /// will only be generated for devices that have been connected with `connect_device`.
+    ///
+    /// On iOS/iPadOS connection and disconnection events can be generated for any device.
+    #[inline]
+    pub async fn device_connection_events<'a>(
+        &'a self,
+        device: &'a Device,
+    ) -> Result<impl Stream<Item = ConnectionEvent> + Send + Unpin + 'a> {
+        self.0.device_connection_events(device).await
     }
 }
